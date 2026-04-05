@@ -45,11 +45,51 @@ def fetch_arxiv_data(query: str, max_results: int=50) -> pl.DataFrame:
     return pl.DataFrame(data)
 
 # Semantic Scholar API
+#WAITING ON API KEY BC CANT REALLY DO ANYTHING WITH THESE RATE LIMITS
+#https://www.semanticscholar.org/product/api%2Ftutorial
+def fetch_SS_data(query: str, limit: int=50) -> pl.DataFrame:
+    url = "https://api.semanticscholar.org/graph/v1/paper/search"
+    query_params = {
+        "query": query,
+        "limit": limit,
+        "fields": "title,year,abstract,citationCount"
+                    }
+    response = None
+    for attempt in range(3):
+        response = requests.get(url, params=query_params)
+        if response.status_code == 429:
+            wait = 5 * (attempt + 1)
+            print(f"Rate limited, waiting {wait}s...")
+            time.sleep(wait)
+        else:
+            break
+    
+    response.raise_for_status()
+
+    return [
+        #https://info.arxiv.org/help/api/user-manual.html
+        {
+            "source": "semantic_scholar",
+            "query": query,
+            "title": p.get("title", ""),
+            "abstract": p.get("abstract", ""),
+            "published": p.get("publicationDate") or str(p.get("year", "")),
+            "citation_count": p.get("citationCount", 0),
+            "url": f"https://www.semanticscholar.org/paper/{p['paperId']}",
+        }
+        for p in response.json().get("data", [])
+    ]
+
 
 
 # X API
 
 
+# Reddit API?
+
+
 if __name__ == "__main__":
     df = fetch_arxiv_data("AI agents", max_results=5)
+    df1 = fetch_SS_data("AI agents", limit=5)
     print(df)
+    print(df1)
