@@ -1,0 +1,174 @@
+import os
+import time
+import urllib.parse
+import requests
+import xml.etree.ElementTree as ET
+import polars as pl
+from datetime import datetime
+
+#Path setup
+ROOT    = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+OUT_DIR = os.path.join(ROOT, "data", "external")
+os.makedirs(OUT_DIR, exist_ok=True)
+OUT_PATH = os.path.join(OUT_DIR, "arxiv.csv")
+
+
+#configs
+START_DATE = "2023-01-01"
+END_DATE = datetime.today().strftime("%Y-%m-%d")
+ 
+MAX_PER_REQUEST = 500 # arXiv allows up to 2000
+DELAY = 3.5 # seconds — arXiv asks for 3s minimum between requests
+ 
+NS = {"atom": "http://www.w3.org/2005/Atom"}
+ 
+# Category queries lined up with newsletter domains
+QUERIES = [
+    "cat:cs.AI",
+    "cat:cs.LG",
+    "cat:cs.CL",
+    "cat:cs.CR",
+    "cat:cs.SE",
+    "cat:q-fin.ST",
+    "cat:q-fin.TR",
+    "cat:q-bio.QM",
+    "cat:q-bio.GN",
+]
+ 
+#Fetch arXiv papers for a single query. Returns a Polars DataFrame.
+def fetch_arxiv_data(query: str, max_results: int = 50) -> pl.DataFrame:
+    base_url = "http://export.arxiv.org/api/query?"
+    params = {
+        "search_query": query,
+        "start": 0,
+        "max_results": max_results,
+        "sortBy": "submittedDate",
+        "sortOrder": "descending",
+    }
+ 
+    url = base_url + urllib.parse.urlencode(params)
+    response = requests.get(url, timeout=30)
+ 
+    if response.status_code != 200:
+        raise Exception(f"API request failed with status code {response.status_code}")
+ 
+    root = ET.fromstring(response.text)
+ 
+    data = [
+        {
+            "source":"arxiv",
+            "query": query,
+            "title": entry.find("atom:title", NS).text.strip(),
+            "abstract": entry.find("atom:summary", NS).text.strip(),
+            "published": entry.find("atom:published", NS).text[:10],
+            "citation_count": None,
+            "url": entry.find("atom:id", NS).text.strip(),
+        }
+        for entry in root.findall("atom:entry", NS)
+    ]
+ 
+    return pl.DataFrame(data)
+
+
+#Pull all papers for a query within a date range by paginating. Returns a combined Polars DataFrame.
+def fetch_arxiv_bulk(query: str, start_date: str, end_date: str) -> pl.DataFrame:
+    all_frames = []
+    start      = 0
+ 
+    while True:
+        base_url = "http://export.arxiv.org/api/query?"
+        params = {
+            "search_query": query,
+            "start": start,
+            "max_results": MAX_PER_REQUEST,
+            "sortBy": "submittedDate",
+            "sortOrder":"descending",
+        }
+ 
+        url = base_url + urllib.parse.urlencode(params)
+        response = requests.get(url, timeout=30)
+ 
+        if response.status_code != 200:
+            print(f"  Request failed: {response.status_code}, stopping.")
+            break
+ 
+        root = ET.fromstring(response.text)
+        entries = root.findall("atom:entry", NS)
+ 
+        if not entries:
+            break
+ 
+        batch = []
+        stop  = False
+ 
+        for entry in entries:
+            published = entry.find("atom:published", NS).text[:10]
+ 
+            # sorted descending—once before start_date we're done
+            if published < start_date:
+                stop = True
+                break
+ 
+            if published > end_date:
+                continue
+ 
+            batch.append({
+                "source": "arxiv",
+                "query": query,
+                "title":entry.find("atom:title", NS).text.strip(),
+                "abstract": entry.find("atom:summary", NS).text.strip(),
+                "published":published,
+                "citation_count": None,
+                "url": entry.find("atom:id", NS).text.strip(),
+            })
+ 
+        if batch:
+            all_frames.append(pl.DataFrame(batch))
+            print(f"Batch start={start}: {len(batch)} papers")
+ 
+        if stop or len(entries) < MAX_PER_REQUEST:
+            break
+ 
+        start += MAX_PER_REQUEST
+        time.sleep(DELAY)
+ 
+    if not all_frames:
+        return pl.DataFrame(schema={
+            "source": pl.Utf8, "query": pl.Utf8, "title": pl.Utf8,
+            "abstract": pl.Utf8, "published": pl.Utf8,
+            "citation_count": pl.Utf8, "url": pl.Utf8,
+        })
+ 
+    return pl.concat(all_frames)
+
+def main():
+    print(f"ArXiv bulk pull: {START_DATE} to {END_DATE}")
+    print(f"Queries: {len(QUERIES)}\n")
+ 
+    all_frames = []
+ 
+    for i, query in enumerate(QUERIES):
+        print(f"[{i+1}/{len(QUERIES)}] {query}")
+        df = fetch_arxiv_bulk(query, START_DATE, END_DATE)
+        print(f"  Total: {len(df)} papers")
+        all_frames.append(df)
+        time.sleep(DELAY)
+ 
+    combined = pl.concat(all_frames)
+ 
+    # deduplicate by URL (same paper can appear in multiple categories)
+    combined = combined.unique(subset=["url"])
+    combined = combined.sort("published", descending=True)
+ 
+    combined.write_csv(OUT_PATH)
+    print(f"\nDone. Saved {len(combined)} papers -> {OUT_PATH}")
+    print("\nPapers per query:")
+    print(
+        combined.group_by("query")
+        .agg(pl.len().alias("count"))
+        .sort("count", descending=True)
+    )
+ 
+ 
+if __name__ == "__main__":
+    main()
