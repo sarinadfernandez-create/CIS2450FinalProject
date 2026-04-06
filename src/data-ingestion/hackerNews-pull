@@ -1,11 +1,189 @@
-import requests
-import pandas as pd
-import time
 import os
-from datetime import datetime, timedelta
+import time
+import requests
+import polars as pl
+from datetime import datetime
 
 #Path setup
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT= os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT_DIR = os.path.join(ROOT, "data", "external")
 os.makedirs(OUT_DIR, exist_ok=True)
 OUT_PATH = os.path.join(OUT_DIR, "hackernews.csv")
+
+#Configs
+START_DATE = "2023-01-01"
+END_DATE = datetime.today().strftime("%Y-%m-%d")
+
+MAX_PER_QUERY = 500
+DELAY = 0.5 
+
+HN_API = "https://hn.algolia.com/api/v1/search_by_date"
+
+#Topic queries aligned with newsletter domains
+TOPICS = [
+    #AI/ML
+    "large language model", "LLM", "GPT", "Claude", "Gemini",
+    "machine learning", "deep learning", "diffusion model",
+    "reinforcement learning", "RAG", "transformer",
+    #Dev/infrastrcture
+    "Rust", "WebAssembly", "Kubernetes", "serverless",
+    "open source", "developer tools",
+    #Fintech
+    "fintech", "payments", "stablecoin", "DeFi",
+    "quantitative finance", "algorithmic trading",
+    #Biotech
+    "CRISPR", "gene therapy", "protein folding", "AlphaFold",
+    "biotech", "genomics", "drug discovery",
+    #Startups/VC
+    "startup", "Y Combinator", "venture capital",
+    "Series A", "acquisition", "IPO",
+    #General emerging tech
+    "robotics", "autonomous", "quantum computing",
+    "semiconductor", "GPU", "edge computing",
+]
+
+
+def date_to_unix(date_str: str) -> int:
+    return int(datetime.strptime(date_str, "%Y-%m-%d").timestamp())
+
+
+def week_of(date_str: str) -> str:
+    d = datetime.strptime(date_str, "%Y-%m-%d")
+    iso = d.isocalendar()
+    return f"{iso[0]}-W{iso[1]:02d}"
+
+
+#Fetch HN stories for a single topic. Returns a Polars DataFrame.
+def fetch_hn_data(topic: str, max_results: int = 50) -> pl.DataFrame:
+    params = {
+        "query":topic,
+        "tags": "story",
+        "numericFilters": f"created_at_i>{date_to_unix(START_DATE)},created_at_i<{date_to_unix(END_DATE)}",
+        "hitsPerPage":min(max_results, 100),
+        "page":0,
+    }
+    response = requests.get(HN_API, params=params, timeout=15)
+
+    if response.status_code != 200:
+        raise Exception(f"API request failed with status code {response.status_code}")
+
+    hits = response.json().get("hits", [])
+
+    data = [
+        {
+            "source":"hackernews",
+            "query":topic,
+            "title":h.get("title", ""),
+            "url":h.get("url", ""),
+            "author": h.get("author", ""),
+            "points":h.get("points", 0),
+            "num_comments": h.get("num_comments", 0),
+            "published":h.get("created_at", "")[:10],
+            "week": week_of(h.get("created_at", "2023-01-01")[:10]),
+            "hn_id":h.get("objectID", ""),
+        }
+        for h in hits
+        if h.get("created_at", "")
+    ]
+
+    return pl.DataFrame(data)
+
+
+# Pull all stories for a topic within the date range by paginating. Returns a combined Polars DataFrame.
+def fetch_hn_bulk(topic: str, start_date: str, end_date: str) -> pl.DataFrame:
+    all_frames = []
+    page       = 0
+    num_start = date_to_unix(start_date)
+    num_end   = date_to_unix(end_date)
+    while len(all_frames) * 100 < MAX_PER_QUERY:
+        params = {
+            "query":topic,
+            "tags": "story",
+            "numericFilters": f"created_at_i>{num_start},created_at_i<{num_end}",
+            "hitsPerPage":100,
+            "page":page,
+        }
+        response = requests.get(HN_API, params=params, timeout=15)
+        if response.status_code != 200:
+            print(f"  Request failed: {response.status_code}, stopping.")
+            break
+
+        data= response.json()
+        hits = data.get("hits", [])
+        total_pages = data.get("nbPages", 1)
+
+        if not hits:
+            break
+        batch = [
+            {
+                "source":"hackernews",
+                "query":topic,
+                "title":h.get("title", ""),
+                "url": h.get("url", ""),
+                "author":h.get("author", ""),
+                "points": h.get("points", 0),
+                "num_comments": h.get("num_comments", 0),
+                "published": h.get("created_at", "")[:10],
+                "week":week_of(h.get("created_at", "2023-01-01")[:10]),
+                "hn_id":h.get("objectID", ""),
+            }
+            for h in hits
+            if h.get("created_at", "")
+        ]
+        if batch:
+            all_frames.append(pl.DataFrame(batch))
+            print(f"  Batch page={page}: {len(batch)} stories")
+        page += 1
+        if page >= total_pages:
+            break
+
+        time.sleep(DELAY)
+
+    if not all_frames:
+        return pl.DataFrame(schema={
+            "source":pl.Utf8,
+            "query": pl.Utf8,
+            "title": pl.Utf8,
+            "url": pl.Utf8,
+            "author": pl.Utf8,
+            "points": pl.Int64,
+            "num_comments": pl.Int64,
+            "published":pl.Utf8,
+            "week":pl.Utf8,
+            "hn_id": pl.Utf8,
+        })
+
+    return pl.concat(all_frames)
+
+
+def main():
+    print(f"HackerNews bulk pull: {START_DATE} to {END_DATE}")
+    print(f"Topics: {len(TOPICS)}\n")
+
+    all_frames = []
+
+    for i, topic in enumerate(TOPICS):
+        print(f"[{i+1}/{len(TOPICS)}] '{topic}'")
+        df = fetch_hn_bulk(topic, START_DATE, END_DATE)
+        print(f"  Total: {len(df)} stories")
+        all_frames.append(df)
+        time.sleep(DELAY)
+
+    combined = pl.concat(all_frames)
+
+    #same story can match multiple topics—keep all (useful for features)
+    combined = combined.unique(subset=["hn_id", "query"])
+    combined = combined.sort("published", descending=True)
+
+    combined.write_csv(OUT_PATH)
+    print(f"\nDone. Saved {len(combined)} rows -> {OUT_PATH}")
+    print("\nStories per topic:")
+    print(
+        combined.group_by("query")
+        .agg(pl.len().alias("count"))
+        .sort("count", descending=True)
+    )
+
+
+if __name__ == "__main__":
+    main()

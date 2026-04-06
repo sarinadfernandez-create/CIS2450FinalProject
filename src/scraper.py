@@ -71,31 +71,35 @@ def generate_weekdays(start: str, end: str):
     return dates
  
 def scrape_tldr_archive(edition_name, slug):
-    """
-    Probe every weekday URL for a TLDR edition.
-    Issues that don't exist will 404 or redirect — skip them.
-    Returns list of dicts.
-    """
     print(f"\nScraping TLDR: {edition_name} ({TLDR_START_DATE} to {TLDR_END_DATE})")
     dates = generate_weekdays(TLDR_START_DATE, TLDR_END_DATE)
     print(f"  Probing {len(dates)} weekday dates...")
- 
+
+    out_path = os.path.join(RAW_DIR, f"{edition_name}.csv")
+    already_done = set()
+    if os.path.exists(out_path):
+        existing = pd.read_csv(out_path)
+        already_done = set(existing["date"].tolist())
+        print(f"  Resuming — skipping {len(already_done)} already scraped dates")
+
     records = []
     for i, date in enumerate(dates):
+        if date in already_done:
+            continue
+
         url = f"https://tldr.tech/{slug}/{date}"
-        r = get(url, delay=1)  # shorter delay since most will 404 fast
+        r = get(url, delay=2)
         if not r:
-            continue  # 404 or timeout — issue doesn't exist for this date
- 
-        # Confirm it's actually an issue page, not a redirect to homepage
+            continue
+
         if "tldr.tech" not in r.url or date not in r.url:
             continue
- 
+
         rec = scrape_tldr_issue(edition_name, url, date, r)
         if rec:
             records.append(rec)
             print(f"  [+] {date} — found ({len(records)} total)")
- 
+
     return records
  
  
@@ -275,18 +279,18 @@ def scrape_the_batch(max_issues=100):
     return records
 
 #-------------SAVING EVERYTHING--------------------------
-
 def save(records, name):
     if not records:
         print(f"  No records to save for {name}")
         return
     df = pd.DataFrame(records)
-    # Drop rows with no text
     df = df[df["text"].str.len() > 50].reset_index(drop=True)
     path = os.path.join(RAW_DIR, f"{name}.csv")
-    df.to_csv(path, index=False)
-    print(f"  Saved {len(df)} rows -> {path}")
-
+    if os.path.exists(path):
+        df.to_csv(path, mode="a", header=False, index=False)
+    else:
+        df.to_csv(path, index=False)
+    print(f"  Saved {len(df)} new rows -> {path}")
 
 
 ALL_SOURCES = list(TLDR_EDITIONS.keys()) + list(SUBSTACK_SOURCES.keys()) + ["the_batch"]
