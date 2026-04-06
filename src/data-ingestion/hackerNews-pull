@@ -14,7 +14,7 @@ OUT_PATH = os.path.join(OUT_DIR, "hackernews.csv")
 START_DATE = "2023-01-01"
 END_DATE = datetime.today().strftime("%Y-%m-%d")
 
-MAX_PER_QUERY = 500
+MAX_PER_QUERY = 2000
 DELAY = 0.5 
 
 HN_API = "https://hn.algolia.com/api/v1/search_by_date"
