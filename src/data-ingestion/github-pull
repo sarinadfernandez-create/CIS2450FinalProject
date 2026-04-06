@@ -1,0 +1,191 @@
+import os
+import time
+import requests
+import polars as pl
+from datetime import datetime
+
+# Path setup
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+OUT_DIR = os.path.join(ROOT, "data", "external")
+os.makedirs(OUT_DIR, exist_ok=True)
+OUT_PATH = os.path.join(OUT_DIR, "github.csv")
+
+# Configs
+START_DATE = "2023-01-01"
+END_DATE = datetime.today().strftime("%Y-%m-%d")
+
+MAX_PER_QUERY = 1000  # GitHub search API hard cap is 1000 results per query
+DELAY = 1.5
+
+GITHUB_API = "https://api.github.com/search/repositories"
+TOKEN = os.getenv("GITHUB_TOKEN")
+
+#Topics aligned with newsletter domains
+#Using GitHub topic tags where possible, falling back to keyword search
+QUERIES = [
+    #AI/ML
+    "large language model",
+    "machine learning",
+    "diffusion model",
+    "reinforcement learning",
+    "RAG retrieval augmented",
+    #Dev/infrastructure
+    "developer tools",
+    "WebAssembly",
+    "Kubernetes",
+    "serverless",
+    #Fintech
+    "fintech",
+    "algorithmic trading",
+    "quantitative finance",
+    "DeFi",
+    #Biotech
+    "CRISPR",
+    "genomics",
+    "drug discovery",
+    "protein folding",
+    #Startups/general
+    "open source AI",
+    "robotics",
+    "quantum computing",
+    "semiconductor",
+]
+DATE_CHUNKS = [
+    ("2023-01-01", "2023-12-31"),
+    ("2024-01-01", "2024-12-31"),
+    ("2025-01-01", "2025-12-31"),
+    ("2026-01-01", END_DATE),
+]
+def week_of(date_str: str) -> str:
+    try:
+        d = datetime.strptime(date_str[:10], "%Y-%m-%d")
+        iso = d.isocalendar()
+        return f"{iso[0]}-W{iso[1]:02d}"
+    except Exception:
+        return ""
+def get_headers() -> dict:
+    headers = {"Accept": "application/vnd.github+json"}
+    if TOKEN:
+        headers["Authorization"] = f"Bearer {TOKEN}"
+    return headers
+
+def parse_repo(r: dict, query: str) -> dict:
+    created = r.get("created_at", "")[:10]
+    return {
+        "source": "github",
+        "query": query,
+        "repo_id": str(r.get("id", "")),
+        "name": r.get("full_name", ""),
+        "description": r.get("description", "") or "",
+        "stars": r.get("stargazers_count", 0),
+        "forks": r.get("forks_count", 0),
+        "language": r.get("language", "") or "",
+        "topics": ", ".join(r.get("topics", [])),
+        "published": created,
+        "week": week_of(created),
+        "url": r.get("html_url", ""),
+    }
+
+EMPTY_SCHEMA = {
+    "source": pl.Utf8, "query": pl.Utf8, "repo_id": pl.Utf8,
+    "name": pl.Utf8, "description": pl.Utf8, "stars": pl.Int64,
+    "forks": pl.Int64, "language": pl.Utf8, "topics": pl.Utf8,
+    "published": pl.Utf8, "week": pl.Utf8, "url": pl.Utf8,
+}
+
+# Fetch repos for a single query. Returns a Polars DataFrame.
+def fetch_github_data(query: str, max_results: int = 30) -> pl.DataFrame:
+    params = {
+        "q": f"{query} created:{START_DATE}..{END_DATE}",
+        "sort": "stars",
+        "order": "desc",
+        "per_page": min(max_results, 100),
+        "page": 1,
+    }
+    response = requests.get(GITHUB_API, params=params, headers=get_headers(), timeout=30)
+
+    if response.status_code != 200:
+        raise Exception(f"API request failed: {response.status_code} — {response.text[:200]}")
+
+    items = response.json().get("items", [])
+    data = [parse_repo(r, query) for r in items]
+    return pl.DataFrame(data) if data else pl.DataFrame(schema=EMPTY_SCHEMA)
+
+# Pull repos for a query within a date range by paginating.
+def fetch_github_bulk(query: str, start_date: str, end_date: str) -> pl.DataFrame:
+    all_frames = []
+    page = 1
+    total = 0
+    while total < MAX_PER_QUERY:
+        params = {
+            "q": f"{query} created:{start_date}..{end_date}",
+            "sort": "stars",
+            "order": "desc",
+            "per_page": 100,
+            "page": page,
+        }
+        response = requests.get(GITHUB_API, params=params, headers=get_headers(), timeout=30)
+        # handle rate limit
+        if response.status_code == 403:
+            reset = response.headers.get("X-RateLimit-Reset", "")
+            wait = max(int(reset) - int(time.time()), 0) + 5 if reset else 60
+            print(f"  Rate limited, waiting {wait}s...")
+            time.sleep(wait)
+            continue
+        if response.status_code != 200:
+            print(f"  Request failed: {response.status_code} — {response.text[:200]}")
+            break
+
+        data = response.json()
+        items = data.get("items", [])
+        if not items:
+            break
+        batch = [parse_repo(r, query) for r in items]
+
+        if batch:
+            all_frames.append(pl.DataFrame(batch))
+            total += len(batch)
+            print(f"  Batch page={page}: {len(batch)} repos ({total} total)")
+
+        # GitHub caps at 1000 results (10 pages of 100)
+        if len(items) < 100 or page >= 10:
+            break
+        page += 1
+        time.sleep(DELAY)
+
+    return pl.concat(all_frames) if all_frames else pl.DataFrame(schema=EMPTY_SCHEMA)
+def main():
+    if not TOKEN:
+        print("Warning: GITHUB_TOKEN not set. Rate limit is 60 req/hr unauthenticated.")
+
+    print(f"GitHub pull: {START_DATE} to {END_DATE}")
+    print(f"Queries: {len(QUERIES)}\n")
+
+    all_frames = []
+    for i, query in enumerate(QUERIES):
+        print(f"[{i+1}/{len(QUERIES)}] '{query}'")
+        frames = []
+        for start, end in DATE_CHUNKS:
+            df = fetch_github_bulk(query, start, end)
+            frames.append(df)
+            time.sleep(DELAY)
+        combined_query = pl.concat(frames)
+        print(f"  Total: {len(combined_query)} repos")
+        all_frames.append(combined_query)
+        time.sleep(DELAY)
+
+    combined = pl.concat(all_frames)
+    combined = combined.unique(subset=["repo_id", "query"])
+    combined = combined.sort("stars", descending=True)
+
+    combined.write_csv(OUT_PATH)
+    print(f"\nDone. Saved {len(combined)} repos -> {OUT_PATH}")
+    print("\nRepos per query:")
+    print(
+        combined.group_by("query")
+        .agg(pl.len().alias("count"))
+        .sort("count", descending=True)
+    )
+
+if __name__ == "__main__":
+    main()

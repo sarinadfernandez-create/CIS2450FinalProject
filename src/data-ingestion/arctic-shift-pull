@@ -1,0 +1,188 @@
+import os
+import time
+import requests
+import polars as pl
+from datetime import datetime, timezone
+
+# Path setup
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+OUT_DIR = os.path.join(ROOT, "data", "external")
+os.makedirs(OUT_DIR, exist_ok=True)
+OUT_PATH = os.path.join(OUT_DIR, "reddit.csv")
+
+# Configs
+START_DATE = "2023-01-01"
+END_DATE = datetime.today().strftime("%Y-%m-%d")
+MAX_PER_SUBREDDIT = 1000
+DELAY = 1.5
+BASE_URL = "https://arctic-shift.photon-reddit.com"
+SUBREDDITS = [
+    #AI/ML
+    "MachineLearning",
+    "artificial",
+    "LocalLLaMA",
+    "ChatGPT",
+    #General tech
+    "programming",
+    "technology",
+    "webdev",
+    #Fintech
+    "fintech",
+    "algotrading",
+    "quant",
+    #Biotech
+    "biotech",
+    "genetics",
+    "bioinformatics",
+    #Startups/VC
+    "startups",
+    "venturecapital",
+    "YCombinator",
+]
+
+def to_epoch(date_str: str) -> int:
+    return int(datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp())
+
+
+def week_of(date_str: str) -> str:
+    try:
+        d = datetime.strptime(date_str[:10], "%Y-%m-%d")
+        iso = d.isocalendar()
+        return f"{iso[0]}-W{iso[1]:02d}"
+    except Exception:
+        return ""
+
+def parse_post(p: dict, subreddit: str) -> dict:
+    published = datetime.utcfromtimestamp(p.get("created_utc", 0)).strftime("%Y-%m-%d")
+    return {
+        "source": "reddit",
+        "subreddit": subreddit,
+        "title": p.get("title", ""),
+        "text": p.get("selftext", "") or "",
+        "author": p.get("author", ""),
+        "score": p.get("score", 0),
+        "num_comments": p.get("num_comments", 0),
+        "published": published,
+        "week": week_of(published),
+        "post_id": p.get("id", ""),
+        "url": f"https://reddit.com{p.get('permalink', '')}",
+    }
+
+
+EMPTY_SCHEMA = {
+    "source": pl.Utf8, "subreddit": pl.Utf8, "title": pl.Utf8,
+    "text": pl.Utf8, "author": pl.Utf8, "score": pl.Int64,
+    "num_comments": pl.Int64, "published": pl.Utf8,
+    "week": pl.Utf8, "post_id": pl.Utf8, "url": pl.Utf8,
+}
+
+# Fetch posts from one subreddit. Returns a Polars DataFrame.
+def fetch_reddit_data(subreddit: str, limit: int = 100) -> pl.DataFrame:
+    params = {
+        "subreddit": subreddit,
+        "after": to_epoch(START_DATE),
+        "before": to_epoch(END_DATE),
+        "limit": limit,
+        "sort": "desc",
+    }
+    response = requests.get(f"{BASE_URL}/api/posts/search", params=params, timeout=30)
+
+    if response.status_code != 200:
+        raise Exception(f"API request failed: {response.status_code} — {response.text[:200]}")
+
+    posts = response.json().get("data", [])
+    data = [parse_post(p, subreddit) for p in posts]
+    return pl.DataFrame(data) if data else pl.DataFrame(schema=EMPTY_SCHEMA)
+
+
+# Pull all posts from a subreddit within date range by paginating.
+# Arctic Shift paginates via unix timestamps in after/before params.
+def fetch_reddit_bulk(subreddit: str, start_date: str, end_date: str) -> pl.DataFrame:
+    all_frames = []
+    after = to_epoch(start_date)
+    before = to_epoch(end_date)
+    total = 0
+
+    while total < MAX_PER_SUBREDDIT:
+        params = {
+            "subreddit": subreddit,
+            "after": after,
+            "before": before,
+            "limit": 100,
+            "sort": "desc",
+        }
+
+        response = requests.get(f"{BASE_URL}/api/posts/search", params=params, timeout=30)
+
+        remaining = response.headers.get("X-RateLimit-Remaining", "999")
+        if remaining.isdigit() and int(remaining) < 5:
+            print(f"  Rate limit low ({remaining} remaining), waiting 10s...")
+            time.sleep(10)
+
+        if response.status_code != 200:
+            print(f"  Request failed: {response.status_code} — {response.text[:200]}")
+            break
+
+        posts = response.json().get("data", [])
+
+        if not posts:
+            break
+
+        batch = [parse_post(p, subreddit) for p in posts]
+
+        if batch:
+            all_frames.append(pl.DataFrame(batch))
+            total += len(batch)
+            print(f"  Batch: {len(batch)} posts ({total} total)")
+
+        if len(posts) < 100:
+            break
+
+        # paginate: move before to the oldest post in this batch
+        last_utc = posts[-1].get("created_utc", 0)
+        before = int(last_utc)
+
+        time.sleep(DELAY)
+
+    return pl.concat(all_frames) if all_frames else pl.DataFrame(schema=EMPTY_SCHEMA)
+DATE_CHUNKS = [
+    ("2023-01-01", "2023-12-31"),
+    ("2024-01-01", "2024-12-31"),
+    ("2025-01-01", "2025-12-31"),
+    ("2026-01-01", END_DATE),
+]
+
+def main():
+    print(f"Reddit pull via Arctic Shift: {START_DATE} to {END_DATE}")
+    print(f"Subreddits: {len(SUBREDDITS)}\n")
+
+    all_frames = []
+
+    for i, subreddit in enumerate(SUBREDDITS):
+        print(f"[{i+1}/{len(SUBREDDITS)}] r/{subreddit}")
+        frames = []
+        for start, end in DATE_CHUNKS:
+            df = fetch_reddit_bulk(subreddit, start, end)
+            frames.append(df)
+            time.sleep(DELAY)
+        combined_sub = pl.concat(frames)
+        print(f"  Total: {len(combined_sub)} posts")
+        all_frames.append(combined_sub)
+        time.sleep(DELAY)
+
+    combined = pl.concat(all_frames)
+    combined = combined.unique(subset=["post_id"])
+    combined = combined.sort("published", descending=True)
+
+    combined.write_csv(OUT_PATH)
+    print(f"\nDone. Saved {len(combined)} posts -> {OUT_PATH}")
+    print("\nPosts per subreddit:")
+    print(
+        combined.group_by("subreddit")
+        .agg(pl.len().alias("count"))
+        .sort("count", descending=True)
+    )
+
+
+if __name__ == "__main__":
+    main()

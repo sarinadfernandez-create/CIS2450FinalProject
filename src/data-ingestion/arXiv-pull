@@ -22,7 +22,7 @@ DELAY = 3.5 # seconds — arXiv asks for 3s minimum between requests
  
 NS = {"atom": "http://www.w3.org/2005/Atom"}
  
-# Category queries lined up with newsletter domains
+#Category queries lined up with newsletter domains
 QUERIES = [
     "cat:cs.AI",
     "cat:cs.LG",
