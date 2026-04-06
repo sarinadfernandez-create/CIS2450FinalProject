@@ -1,0 +1,196 @@
+import os
+import time
+import requests
+import polars as pl
+from datetime import datetime
+ 
+#Path setup
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+OUT_DIR = os.path.join(ROOT, "data", "external")
+os.makedirs(OUT_DIR, exist_ok=True)
+OUT_PATH = os.path.join(OUT_DIR, "semantic_scholar.csv")
+ 
+#Configs
+START_DATE = "2023-01-01"
+END_DATE = datetime.today().strftime("%Y-%m-%d")
+ 
+MAX_PER_REQUEST = 100
+MAX_PER_QUERY = 5000
+DELAY = 1.5
+ 
+SS_API = "https://api.semanticscholar.org/graph/v1/paper/search"
+API_KEY = os.getenv("SEMANTIC_SCHOLAR_API_KEY")
+ 
+QUERIES = [
+    "large language model",
+    "machine learning",
+    "natural language processing",
+    "diffusion model",
+    "reinforcement learning",
+    "cybersecurity",
+    "software engineering",
+    "quantitative finance",
+    "algorithmic trading",
+    "CRISPR",
+    "gene therapy",
+    "protein folding",
+    "genomics",
+    "drug discovery",
+    "robotics",
+    "quantum computing",
+    "semiconductor",
+]
+ 
+DATE_CHUNKS = [
+    ("2023-01-01", "2023-12-31"),
+    ("2024-01-01", "2024-12-31"),
+    ("2025-01-01", "2025-12-31"),
+    ("2026-01-01", END_DATE),
+]
+
+#Fetch SS papers for a single query. Returns a Polars DataFrame.
+def fetch_SS_data(query: str, limit: int = 50) -> pl.DataFrame:
+    params = {
+        "query": query,
+        "limit": limit,
+        "fields": "title,abstract,publicationDate,year,citationCount,paperId",
+    }
+    headers = {"x-api-key": API_KEY} if API_KEY else {}
+ 
+    response = None
+    for attempt in range(3):
+        response = requests.get(SS_API, params=params, headers=headers, timeout=30)
+        if response.status_code == 429:
+            wait = 5 * (attempt + 1)
+            print(f"  Rate limited, waiting {wait}s...")
+            time.sleep(wait)
+        else:
+            break
+    response.raise_for_status()
+ 
+    data = [
+        {
+            "source": "semantic_scholar",
+            "query": query,
+            "title": p.get("title", ""),
+            "abstract": p.get("abstract", "") or "",
+            "published": p.get("publicationDate") or str(p.get("year", "")),
+            "citation_count": p.get("citationCount", 0),
+            "url": f"https://www.semanticscholar.org/paper/{p['paperId']}",
+        }
+        for p in response.json().get("data", [])
+    ]
+    return pl.DataFrame(data) if data else pl.DataFrame(schema={
+        "source": pl.Utf8, "query": pl.Utf8, "title": pl.Utf8,
+        "abstract": pl.Utf8, "published": pl.Utf8,
+        "citation_count": pl.Int64, "url": pl.Utf8,
+    })
+ 
+ 
+#Pull all papers for a query within date range by paginating.
+#Returns a combined Polars DataFrame.
+def fetch_SS_bulk(query: str, start_date: str, end_date: str) -> pl.DataFrame:
+    all_frames = []
+    offset = 0
+    headers = {"x-api-key": API_KEY} if API_KEY else {}
+ 
+    while offset < MAX_PER_QUERY:
+        params = {
+            "query": query,
+            "limit": MAX_PER_REQUEST,
+            "offset": offset,
+            "fields": "title,abstract,publicationDate,year,citationCount,paperId",
+            "publicationDateOrYear": f"{start_date}:{end_date}",
+        }
+ 
+        response = None
+        for attempt in range(3):
+            response = requests.get(SS_API, params=params, headers=headers, timeout=30)
+            if response.status_code == 429:
+                wait = 5 * (attempt + 1)
+                print(f"  Rate limited, waiting {wait}s...")
+                time.sleep(wait)
+            else:
+                break
+ 
+        if response.status_code != 200:
+            print(f"  Request failed: {response.status_code}, stopping.")
+            break
+ 
+        data = response.json()
+        papers = data.get("data", [])
+ 
+        if not papers:
+            break
+ 
+        batch = [
+            {
+                "source": "semantic_scholar",
+                "query": query,
+                "title": p.get("title", ""),
+                "abstract": p.get("abstract", "") or "",
+                "published": p.get("publicationDate") or str(p.get("year", "")),
+                "citation_count": p.get("citationCount", 0),
+                "url": f"https://www.semanticscholar.org/paper/{p['paperId']}",
+            }
+            for p in papers
+        ]
+ 
+        if batch:
+            all_frames.append(pl.DataFrame(batch))
+            print(f"  Batch offset={offset}: {len(batch)} papers")
+ 
+        total = data.get("total", 0)
+        offset += MAX_PER_REQUEST
+ 
+        if offset >= total:
+            break
+ 
+        time.sleep(DELAY)
+ 
+    if not all_frames:
+        return pl.DataFrame(schema={
+            "source": pl.Utf8, "query": pl.Utf8, "title": pl.Utf8,
+            "abstract": pl.Utf8, "published": pl.Utf8,
+            "citation_count": pl.Int64, "url": pl.Utf8,
+        })
+ 
+    return pl.concat(all_frames)
+ 
+ 
+def main():
+    if not API_KEY:
+        print("Warning: SEMANTIC_SCHOLAR_API_KEY not set.")
+ 
+    print(f"Semantic Scholar bulk pull: {START_DATE} to {END_DATE}")
+    print(f"Queries: {len(QUERIES)}\n")
+ 
+    all_frames = []
+ 
+    for i, query in enumerate(QUERIES):
+        print(f"[{i+1}/{len(QUERIES)}] '{query}'")
+        frames = []
+        for start, end in DATE_CHUNKS:
+            df = fetch_SS_bulk(query, start, end)
+            frames.append(df)
+            time.sleep(DELAY)
+        combined_query = pl.concat(frames)
+        print(f"  Total: {len(combined_query)} papers")
+        all_frames.append(combined_query)
+ 
+    combined = pl.concat(all_frames)
+    combined = combined.unique(subset=["url"])
+    combined = combined.sort("published", descending=True)
+ 
+    combined.write_csv(OUT_PATH)
+    print(f"\nDone. Saved {len(combined)} papers -> {OUT_PATH}")
+    print("\nPapers per query:")
+    print(
+        combined.group_by("query")
+        .agg(pl.len().alias("count"))
+        .sort("count", descending=True)
+    )
+ 
+ 
+if __name__ == "__main__":
+    main()
