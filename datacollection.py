@@ -83,7 +83,31 @@ def fetch_SS_data(query: str, limit: int=50) -> pl.DataFrame:
 
 
 # X API
+def fetch_X_data(query: str, bearer_token: str, max_results: int = 100) -> pl.DataFrame:
+    resp = requests.get(
+        "https://api.twitter.com/2/tweets/search/recent",
+        headers={"Authorization": f"Bearer {bearer_token}"},
+        params={
+            "query": f"{query} -is:retweet lang:en",
+            "max_results": min(max_results, 100),
+            "tweet.fields": "created_at,public_metrics,text",
+        },
+    )
+    resp.raise_for_status()
 
+    return pl.DataFrame([
+        {
+            "source": "twitter",
+            "query": query,
+            "text": t["text"],
+            "published": t["created_at"][:10],
+            "likes": t.get("public_metrics", {}).get("like_count", 0),
+            "retweets": t.get("public_metrics", {}).get("retweet_count", 0),
+            "replies": t.get("public_metrics", {}).get("reply_count", 0),
+            "sentiment": None,
+        }
+        for t in resp.json().get("data", [])
+    ])
 
 # Reddit API?
 
