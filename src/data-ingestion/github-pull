@@ -124,22 +124,35 @@ def fetch_github_bulk(query: str, start_date: str, end_date: str) -> pl.DataFram
             "per_page": 100,
             "page": page,
         }
-        response = requests.get(GITHUB_API, params=params, headers=get_headers(), timeout=30)
-        # handle rate limit
+
+        for attempt in range(3):
+            try:
+                response = requests.get(GITHUB_API, params=params, headers=get_headers(), timeout=30)
+                break
+            except (requests.exceptions.ConnectionError, requests.exceptions.ReadTimeout) as e:
+                print(f"  Connection error (attempt {attempt+1}): {e}")
+                time.sleep(10 * (attempt + 1))
+        else:
+            print("  Failed after 3 attempts, skipping batch.")
+            break
+
         if response.status_code == 403:
             reset = response.headers.get("X-RateLimit-Reset", "")
             wait = max(int(reset) - int(time.time()), 0) + 5 if reset else 60
             print(f"  Rate limited, waiting {wait}s...")
             time.sleep(wait)
             continue
+
         if response.status_code != 200:
             print(f"  Request failed: {response.status_code} — {response.text[:200]}")
             break
 
         data = response.json()
         items = data.get("items", [])
+
         if not items:
             break
+
         batch = [parse_repo(r, query) for r in items]
 
         if batch:
@@ -147,45 +160,57 @@ def fetch_github_bulk(query: str, start_date: str, end_date: str) -> pl.DataFram
             total += len(batch)
             print(f"  Batch page={page}: {len(batch)} repos ({total} total)")
 
-        # GitHub caps at 1000 results (10 pages of 100)
         if len(items) < 100 or page >= 10:
             break
+
         page += 1
         time.sleep(DELAY)
 
     return pl.concat(all_frames) if all_frames else pl.DataFrame(schema=EMPTY_SCHEMA)
+
+
 def main():
     if not TOKEN:
-        print("Warning: GITHUB_TOKEN not set. Rate limit is 60 req/hr unauthenticated.")
+        print("Warning: GITHUB_TOKEN not set.")
 
     print(f"GitHub pull: {START_DATE} to {END_DATE}")
     print(f"Queries: {len(QUERIES)}\n")
 
+    # resume logic
+    completed = set()
+    if os.path.exists(OUT_PATH):
+        existing = pl.read_csv(OUT_PATH)
+        completed = set(existing["query"].unique().to_list())
+        print(f"Resuming — skipping {len(completed)} completed queries\n")
+
     all_frames = []
+    if os.path.exists(OUT_PATH):
+        all_frames.append(pl.read_csv(OUT_PATH))
+
     for i, query in enumerate(QUERIES):
+        if query in completed:
+            print(f"[{i+1}/{len(QUERIES)}] '{query}' — skipping")
+            continue
+
         print(f"[{i+1}/{len(QUERIES)}] '{query}'")
         frames = []
         for start, end in DATE_CHUNKS:
             df = fetch_github_bulk(query, start, end)
             frames.append(df)
             time.sleep(DELAY)
+
         combined_query = pl.concat(frames)
         print(f"  Total: {len(combined_query)} repos")
         all_frames.append(combined_query)
-        time.sleep(DELAY)
 
-    combined = pl.concat(all_frames)
-    combined = combined.unique(subset=["repo_id", "query"])
+        # save after each query so crashes don't lose progress
+        combined = pl.concat(all_frames).unique(subset=["repo_id", "query"])
+        combined.write_csv(OUT_PATH)
+
+    combined = pl.concat(all_frames).unique(subset=["repo_id", "query"])
     combined = combined.sort("stars", descending=True)
-
     combined.write_csv(OUT_PATH)
     print(f"\nDone. Saved {len(combined)} repos -> {OUT_PATH}")
-    print("\nRepos per query:")
-    print(
-        combined.group_by("query")
-        .agg(pl.len().alias("count"))
-        .sort("count", descending=True)
-    )
 
 if __name__ == "__main__":
     main()
