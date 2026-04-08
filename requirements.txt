@@ -1,4 +1,10 @@
 polars
 requests
+beautifulsoup4
+pandas
 transformers
 torch
+vaderSentiment
+matplotlib
+seaborn
+scipy
