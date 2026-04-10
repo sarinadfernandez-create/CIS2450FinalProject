@@ -6,6 +6,8 @@ Input:  data/external/*.csv (arXiv, HackerNews, Reddit, GitHub, Semantic Scholar
 Output: data/processed/candidate_phrases.csv
         Columns: phrase, score, source, date, week
 """
+import warnings
+warnings.filterwarnings("ignore")
 
 import os
 import polars as pl
@@ -53,12 +55,11 @@ SOURCES = {
     },
 }
 
-# Limit rows per source to keep runtime reasonable
-# arXiv and SS can be huge — sample if needed
+# Limit rows per source to keep runtime reasonable (especially for arXiv and Semantic Scholar which have many documents)
 MAX_ROWS = {
-    "arxiv": 50000,
-    "semantic_scholar": 50000,
-    "hackernews": None,  # no limit
+    "arxiv": 20000,
+    "semantic_scholar": 20000,
+    "hackernews": None,
     "reddit": None,
     "github": None,
 }
@@ -81,7 +82,7 @@ def load_source(source_name: str, config: dict) -> pl.DataFrame:
 
     df = pl.read_csv(path, infer_schema_length=1000)
 
-    # combine text columns into one
+    #combine text columns into one
     text_cols = [c for c in config["text_cols"] if c in df.columns]
     if not text_cols:
         print(f"  Skipping {source_name} — no text columns found")
@@ -92,7 +93,7 @@ def load_source(source_name: str, config: dict) -> pl.DataFrame:
         .alias("combined_text")
     )
 
-    # normalize date column
+    #normalize date column
     date_col = config["date_col"]
     if date_col in df.columns:
         df = df.rename({date_col: "date"})
@@ -101,7 +102,7 @@ def load_source(source_name: str, config: dict) -> pl.DataFrame:
 
     df = df.filter(pl.col("combined_text").str.len_chars() > 20)
 
-    # sample if needed
+    #sample if needed
     max_rows = MAX_ROWS.get(source_name)
     if max_rows and len(df) > max_rows:
         df = df.sample(n=max_rows, seed=42)
@@ -161,6 +162,9 @@ def main():
         records = extract_phrases(kw_model, df, source_name)
         print(f"  Extracted {len(records)} phrases")
         all_records.extend(records)
+        pl.DataFrame(all_records).sort(["date", "score"], descending=[False, True]).write_csv(OUT_PATH)
+        print(f"  Checkpoint saved ({len(all_records)} total phrases so far)")
+    
 
     combined = pl.DataFrame(all_records)
     combined = combined.sort(["date", "score"], descending=[False, True])
