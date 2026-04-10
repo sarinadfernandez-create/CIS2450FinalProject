@@ -46,6 +46,7 @@ def load_newsletter(source: str) -> pl.DataFrame:
     df = df.filter(pl.col("text").str.len_chars() > 100)
     return df
 
+#Learning how to use keybert: https://www.maartengrootendorst.com/blog/keybert/
 def extract_topics(kw_model: KeyBERT, df: pl.DataFrame, source: str) -> list[dict]:
     records = []
     texts = df["text"].to_list()
