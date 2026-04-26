@@ -333,7 +333,7 @@ def cluster_unmapped(
     return cluster_map
 
 
-def filter_discovered_topics(
+def filter_discovered_topics( # no longer using
     model: SentenceTransformer,
     discovered: list[str],
     min_tech_similarity: float = 0.30,
@@ -414,13 +414,9 @@ def main():
     discovered_raw = list(set(cluster_map.values()))
     print(f"  Discovered {len(discovered_raw)} raw cluster topics")
  
-    #filter discovered topics for tech relevance
-    print("\nFiltering discovered topics for tech relevance...")
-    discovered = filter_discovered_topics(model, discovered_raw)
-    print(f"  Kept {len(discovered)} / {len(discovered_raw)} discovered topics")
  
-    #remove cluster assignments for topics that were filtered out
-    kept_set = set(discovered)
+    #remove cluster assignments for topics that were filtered out 
+    kept_set = set(discovered_raw)
     cluster_map = {k: v for k, v in cluster_map.items() if v in kept_set}
  
     #finalize newsletter mapping
@@ -442,10 +438,10 @@ def main():
     print(f"\nSaved newsletter map: {len(nl_map_df)} rows -> {NEWSLETTER_MAP_OUT}")
  
     #build canonical topic list
-    all_canonical = SEED_TOPICS + discovered
+    all_canonical = SEED_TOPICS + discovered_raw
     canonical_df = pl.DataFrame({
         "canonical_topic": all_canonical,
-        "type": ["seed"] * len(SEED_TOPICS) + ["discovered"] * len(discovered),
+        "type": ["seed"] * len(SEED_TOPICS) + ["discovered"] * len(discovered_raw),
     }).unique(subset=["canonical_topic"])
     canonical_df.write_csv(TOPICS_OUT)
     print(f"Saved {len(canonical_df)} canonical topics -> {TOPICS_OUT}")
@@ -489,7 +485,7 @@ def main():
     print("\n" + "=" * 60)
     print("SUMMARY")
     print("=" * 60)
-    print(f"Canonical topics: {len(canonical_df)} ({len(SEED_TOPICS)} seed + {len(discovered)} discovered)")
+    print(f"Canonical topics: {len(canonical_df)} ({len(SEED_TOPICS)} seed + {len(discovered_raw)} discovered_raw)")
     print(f"Newsletter phrases mapped: {len(nl_map_df)}")
     print(f"Signal phrases mapped: {len(sig_map_df)}")
  
